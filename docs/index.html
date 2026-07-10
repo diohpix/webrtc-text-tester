@@ -47,9 +47,12 @@
 //   GET  /rooms/{room}/poll   ?peer_id=&token=&wait=25  → {messages}
 //   POST /rooms/{room}/leave  {peer_id, token}
 // kind: offer/answer/ice + 서버 발행 peer-joined/peer-left
-// edge는 answerer 전용이므로 offer는 항상 브라우저 몫이다: join 시 기존 피어들에게,
-// 그리고 peer-joined(edge 재기동 포함)마다 새로 offer 한다.
+// 토폴로지: 1:N 별형(star) — 이 페이지는 edge 하고만 연결한다. 브라우저끼리는
+// offer 하지도, 받아주지도 않는다 (룸의 다른 브라우저는 각자 edge 와만 붙는다).
+// edge 는 answerer 전용이므로 offer 는 항상 브라우저 몫: join 시 edge 가 있으면,
+// 그리고 edge 의 peer-joined(재기동 포함)마다 새로 offer 한다.
 const DEFAULT_SIGNAL = 'https://signalsvc-116558809518.asia-northeast3.run.app';
+const EDGE_PEER = 'edge'; // edge 의 룸 내 peer_id (edgeservice config p2p.peer_id 기본값)
 let signalBase = DEFAULT_SIGNAL; // 입장 시 입력창 값으로 확정
 const STUN = [{ urls: 'stun:stun.l.google.com:19302' }];
 const POLL_WAIT = 25;
@@ -124,8 +127,8 @@ async function joinRoom() {
   token = resp.token;
   addMessage(`"${room}" 방 입장 (내 ID: ${myId}, 기존 피어: ${resp.peers.length ? resp.peers.join(', ') : '없음'})`, 'sys');
   refreshStatus();
-  // 나중에 들어온 쪽이 offerer — 기존 피어들에게 offer (edge는 answerer 전용)
-  for (const id of resp.peers) connectTo(id);
+  // 1:N — edge 가 이미 룸에 있으면 edge 에게만 offer (다른 브라우저는 무시)
+  if (resp.peers.includes(EDGE_PEER)) connectTo(EDGE_PEER);
 }
 
 async function pollLoop() {
@@ -158,12 +161,10 @@ async function handleSignal(msg) {
     case 'answer': return handleAnswer(msg.from, msg.payload);
     case 'ice': return handleIce(msg.from, msg.payload);
     case 'peer-joined':
-      // 새로 들어온 피어에게도 offer 를 보낸다. edge 는 answerer 전용이라 먼저
-      // offer 하지 않으므로, edge 가 나중에 (재)기동하는 경우 이쪽에서 재-offer
-      // 해야만 연결된다. 브라우저끼리는 양쪽 다 offer 하는 glare 가 생길 수
-      // 있는데 handleOffer 의 ID 비교 tie-break 로 한쪽만 살아남는다.
       addMessage(`피어 입장: ${msg.from}`, 'sys');
-      await connectTo(msg.from);
+      // 1:N — edge 가 (재)기동해 들어온 경우에만 재-offer. edge 는 answerer
+      // 전용이라 이쪽에서 offer 해야만 연결된다. 다른 브라우저 입장은 표시만.
+      if (msg.from === EDGE_PEER) await connectTo(msg.from);
       break;
     case 'peer-left': {
       addMessage(`피어 퇴장: ${msg.from}`, 'sys');
@@ -216,14 +217,11 @@ async function connectTo(id) {
   addMessage(`${id} 에게 offer 전송 — 연결 시도 중…`, 'sys');
 }
 
-// answerer: 상대가 offer를 보낸 경우 (브라우저-브라우저 조합).
-// glare(양쪽이 동시에 offer) 시 ID 큰 쪽의 offer 가 이긴다: 내 ID 가 크면
-// 상대 offer 를 무시하고 내 offer 의 answer 를 기다리고, 작으면 내 offer 를
-// 버리고 상대에게 answer 한다. (edge 는 offer 하지 않으므로 glare 없음)
+// answerer 역할: 1:N 에서는 edge 가 offer 하지 않으므로 정상 흐름에서 여기 올 일이
+// 없다. 다른 브라우저(구버전 페이지 등)의 offer 는 받지 않는다.
 async function handleOffer(from, payload) {
-  const existing = peers.get(from);
-  if (existing && existing.pc.signalingState === 'have-local-offer' && myId > from) {
-    console.log(`[P2P] glare with ${from} — 내 offer 유지, 상대 offer 무시`);
+  if (from !== EDGE_PEER) {
+    console.log(`[P2P] 1:N — ${from} 의 offer 무시 (edge 전용 연결)`);
     return;
   }
   closePeer(from, 're-offer');
