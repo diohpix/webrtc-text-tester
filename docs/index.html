@@ -186,6 +186,9 @@ function newPeer(id) {
   };
   pc.onconnectionstatechange = () => {
     console.log(`[P2P] peer=${id} state=${pc.connectionState}`);
+    if (pc.connectionState === 'failed') {
+      addMessage(`${id} 연결 실패 (ICE failed — NAT 통과 불가, TURN 필요 가능성)`, 'sys');
+    }
     if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
       closePeer(id, pc.connectionState);
     }
@@ -210,6 +213,7 @@ async function connectTo(id) {
   const offer = await p.pc.createOffer();
   await p.pc.setLocalDescription(offer);
   await sendSignal(id, 'offer', p.pc.localDescription.toJSON());
+  addMessage(`${id} 에게 offer 전송 — 연결 시도 중…`, 'sys');
 }
 
 // answerer: 상대가 offer를 보낸 경우 (브라우저-브라우저 조합).
@@ -231,6 +235,7 @@ async function handleOffer(from, payload) {
   const answer = await p.pc.createAnswer();
   await p.pc.setLocalDescription(answer);
   await sendSignal(from, 'answer', p.pc.localDescription.toJSON());
+  addMessage(`${from} 의 offer 에 answer 전송 — 연결 시도 중…`, 'sys');
 }
 
 async function handleAnswer(from, payload) {
