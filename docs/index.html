@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebRTC 텍스트 송수신</title>
+<style>
+  body { font-family: -apple-system, "Apple SD Gothic Neo", sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; }
+  h1 { font-size: 1.3rem; }
+  #status { padding: 8px 12px; border-radius: 6px; background: #eee; margin-bottom: 12px; font-size: 0.9rem; }
+  #status.connected { background: #d4f7d4; }
+  #log { border: 1px solid #ccc; border-radius: 6px; height: 300px; overflow-y: auto; padding: 8px; margin-bottom: 12px; }
+  .msg { margin: 4px 0; padding: 6px 10px; border-radius: 8px; max-width: 80%; width: fit-content; }
+  .msg.recv { background: #f0f0f0; }
+  .msg.sent { background: #d0e7ff; margin-left: auto; }
+  .msg.sys { background: none; color: #888; font-size: 0.8rem; }
+  .msg .meta { font-size: 0.7rem; color: #888; display: block; }
+  form { display: flex; gap: 8px; }
+  input[type=text] { flex: 1; padding: 8px; border: 1px solid #ccc; border-radius: 6px; }
+  button { padding: 8px 16px; border: 0; border-radius: 6px; background: #2b6cb0; color: #fff; cursor: pointer; }
+  button:disabled { background: #aaa; cursor: not-allowed; }
+  #room-form { margin-bottom: 12px; flex-wrap: wrap; }
+  #signal-input { flex-basis: 100%; }
+</style>
+</head>
+<body>
+<h1>WebRTC DataChannel 텍스트 송수신</h1>
+
+<form id="room-form">
+  <input type="text" id="signal-input" placeholder="시그널 서버 주소 (https://...)">
+  <input type="text" id="room-input" placeholder="방 이름 (예: test)" value="test">
+  <button type="submit" id="join-btn">입장</button>
+</form>
+
+<div id="status">대기 중 — 방에 입장하세요</div>
+<div id="log"></div>
+
+<form id="send-form">
+  <input type="text" id="msg-input" placeholder="보낼 메시지" disabled>
+  <button type="submit" id="send-btn" disabled>전송</button>
+</form>
+
+<script>
+// signalsvc(HTTP long-poll 릴레이 시그널링) 프로토콜 — edge의 p2p/signal.go와 동일:
+//   POST /rooms/{room}/join   {peer_id?}                → {peer_id, token, peers}
+//   POST /rooms/{room}/send   {from, token, to?, kind, payload}
+//   GET  /rooms/{room}/poll   ?peer_id=&token=&wait=25  → {messages}
+//   POST /rooms/{room}/leave  {peer_id, token}
+// kind: offer/answer/ice + 서버 발행 peer-joined/peer-left
+// edge는 answerer 전용이므로 브라우저가 join 시 기존 피어들에게 offer를 보낸다.
+const DEFAULT_SIGNAL = 'https://signalsvc-116558809518.asia-northeast3.run.app';
+let signalBase = DEFAULT_SIGNAL; // 입장 시 입력창 값으로 확정
+const STUN = [{ urls: 'stun:stun.l.google.com:19302' }];
+const POLL_WAIT = 25;
+
+const signalInput = document.getElementById('signal-input');
+const statusEl = document.getElementById('status');
+const logEl = document.getElementById('log');
+const roomForm = document.getElementById('room-form');
+const roomInput = document.getElementById('room-input');
+const joinBtn = document.getElementById('join-btn');
+const sendForm = document.getElementById('send-form');
+const msgInput = document.getElementById('msg-input');
+const sendBtn = document.getElementById('send-btn');
+
+let room = null;
+let myId = null;
+let token = null;
+let polling = false;
+const peers = new Map(); // peerID -> {pc, dc, pending: [], remoteSet: false}
+
+function setStatus(text, connected = false) {
+  statusEl.textContent = text;
+  statusEl.classList.toggle('connected', connected);
+}
+
+function refreshStatus() {
+  const open = [...peers.entries()].filter(([, p]) => p.dc && p.dc.readyState === 'open').map(([id]) => id);
+  const ok = open.length > 0;
+  setStatus(`내 ID: ${myId} · 연결된 피어: ${ok ? open.join(', ') : '없음'}`, ok);
+  msgInput.disabled = !ok;
+  sendBtn.disabled = !ok;
+}
+
+function addMessage(text, kind, from) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + kind;
+  if (kind !== 'sys') {
+    const meta = document.createElement('span');
+    meta.className = 'meta';
+    meta.textContent = (kind === 'recv' ? `수신 ← ${from}` : '송신') + ' · ' + new Date().toLocaleTimeString();
+    div.appendChild(meta);
+  }
+  div.appendChild(document.createTextNode(text));
+  logEl.appendChild(div);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// --- 시그널링 API ---
+function roomPath(suffix) {
+  return `${signalBase}/rooms/${encodeURIComponent(room)}/${suffix}`;
+}
+
+async function apiPost(suffix, body) {
+  const res = await fetch(roomPath(suffix), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw Object.assign(new Error(`${suffix} -> ${res.status}`), { status: res.status });
+  const text = await res.text();
+  return text ? JSON.parse(text) : null;
+}
+
+function sendSignal(to, kind, payload) {
+  return apiPost('send', { from: myId, token, to, kind, payload })
+    .catch(err => console.warn(`[P2P] send ${kind} to ${to} 실패:`, err));
+}
+
+async function joinRoom() {
+  const resp = await apiPost('join', {});
+  myId = resp.peer_id;
+  token = resp.token;
+  addMessage(`"${room}" 방 입장 (내 ID: ${myId}, 기존 피어: ${resp.peers.length ? resp.peers.join(', ') : '없음'})`, 'sys');
+  refreshStatus();
+  // 나중에 들어온 쪽이 offerer — 기존 피어들에게 offer (edge는 answerer 전용)
+  for (const id of resp.peers) connectTo(id);
+}
+
+async function pollLoop() {
+  polling = true;
+  while (polling) {
+    let msgs;
+    try {
+      const q = new URLSearchParams({ peer_id: myId, token, wait: POLL_WAIT });
+      const res = await fetch(roomPath('poll') + '?' + q);
+      if (res.status === 404 || res.status === 403) {
+        // 서버에서 세션이 사라짐 — 재입장
+        addMessage('시그널 세션 만료 — 재입장합니다', 'sys');
+        await joinRoom();
+        continue;
+      }
+      if (!res.ok) throw new Error(`poll -> ${res.status}`);
+      msgs = (await res.json()).messages || [];
+    } catch (err) {
+      console.warn('[P2P] poll 오류:', err);
+      await new Promise(r => setTimeout(r, 2000));
+      continue;
+    }
+    for (const msg of msgs) await handleSignal(msg).catch(e => console.error('[P2P] handle:', e));
+  }
+}
+
+async function handleSignal(msg) {
+  switch (msg.kind) {
+    case 'offer': return handleOffer(msg.from, msg.payload);
+    case 'answer': return handleAnswer(msg.from, msg.payload);
+    case 'ice': return handleIce(msg.from, msg.payload);
+    case 'peer-joined':
+      // 새로 들어온 쪽이 offer를 보내오므로 여기서는 대기만 한다
+      addMessage(`피어 입장: ${msg.from}`, 'sys');
+      break;
+    case 'peer-left': {
+      addMessage(`피어 퇴장: ${msg.from}`, 'sys');
+      const p = peers.get(msg.from);
+      // 룸 퇴장이 곧 P2P 종료는 아님 — 협상 중이던 상태만 정리
+      if (p && (!p.dc || p.dc.readyState !== 'open')) closePeer(msg.from, 'peer-left before connect');
+      break;
+    }
+  }
+}
+
+// --- WebRTC ---
+function newPeer(id) {
+  const pc = new RTCPeerConnection({ iceServers: STUN });
+  const p = { pc, dc: null, pending: [], remoteSet: false };
+  peers.set(id, p);
+
+  pc.onicecandidate = (e) => {
+    if (e.candidate) sendSignal(id, 'ice', e.candidate.toJSON());
+  };
+  pc.onconnectionstatechange = () => {
+    console.log(`[P2P] peer=${id} state=${pc.connectionState}`);
+    if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+      closePeer(id, pc.connectionState);
+    }
+    refreshStatus();
+  };
+  return p;
+}
+
+function setupChannel(id, p, dc) {
+  p.dc = dc;
+  dc.onopen = () => { addMessage(`데이터채널 연결됨: ${id}`, 'sys'); refreshStatus(); };
+  // 텍스트 수신 지점
+  dc.onmessage = (e) => addMessage(typeof e.data === 'string' ? e.data : new TextDecoder().decode(e.data), 'recv', id);
+  dc.onclose = () => refreshStatus();
+}
+
+// offerer: 기존 피어에게 연결 시도
+async function connectTo(id) {
+  closePeer(id, 're-connect');
+  const p = newPeer(id);
+  setupChannel(id, p, p.pc.createDataChannel('chat'));
+  const offer = await p.pc.createOffer();
+  await p.pc.setLocalDescription(offer);
+  await sendSignal(id, 'offer', p.pc.localDescription.toJSON());
+}
+
+// answerer: 브라우저-브라우저 조합에서 상대(나중에 입장)가 offer를 보낸 경우
+async function handleOffer(from, payload) {
+  closePeer(from, 're-offer');
+  const p = newPeer(from);
+  p.pc.ondatachannel = (e) => setupChannel(from, p, e.channel);
+  await p.pc.setRemoteDescription(payload);
+  p.remoteSet = true;
+  for (const c of p.pending.splice(0)) await p.pc.addIceCandidate(c).catch(e => console.warn(e));
+  const answer = await p.pc.createAnswer();
+  await p.pc.setLocalDescription(answer);
+  await sendSignal(from, 'answer', p.pc.localDescription.toJSON());
+}
+
+async function handleAnswer(from, payload) {
+  const p = peers.get(from);
+  if (!p) return console.warn(`[P2P] answer from unknown peer ${from}`);
+  await p.pc.setRemoteDescription(payload);
+  p.remoteSet = true;
+  for (const c of p.pending.splice(0)) await p.pc.addIceCandidate(c).catch(e => console.warn(e));
+}
+
+async function handleIce(from, payload) {
+  const p = peers.get(from);
+  if (!p) return console.warn(`[P2P] ice from unknown peer ${from}`);
+  if (!p.remoteSet) { p.pending.push(payload); return; }
+  await p.pc.addIceCandidate(payload).catch(e => console.warn('[P2P] addIceCandidate:', e));
+}
+
+function closePeer(id, reason) {
+  const p = peers.get(id);
+  if (!p) return;
+  peers.delete(id);
+  p.pc.close();
+  console.log(`[P2P] closed peer=${id} (${reason})`);
+  refreshStatus();
+}
+
+// --- UI ---
+// 시그널 주소 초기값: ?signal= 쿼리 > 지난번 사용값(localStorage) > 기본값
+signalInput.value = new URLSearchParams(location.search).get('signal')
+  || localStorage.getItem('signalBase')
+  || DEFAULT_SIGNAL;
+
+roomForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  room = roomInput.value.trim();
+  signalBase = signalInput.value.trim().replace(/\/+$/, '');
+  if (!room || !signalBase) return;
+  if (location.protocol === 'https:' && signalBase.startsWith('http:')) {
+    setStatus('https 페이지에서는 http:// 시그널 서버를 사용할 수 없습니다 (mixed content 차단)');
+    return;
+  }
+  localStorage.setItem('signalBase', signalBase);
+  signalInput.disabled = true;
+  roomInput.disabled = true;
+  joinBtn.disabled = true;
+  try {
+    await joinRoom();
+    pollLoop();
+  } catch (err) {
+    setStatus(`입장 실패: ${err.message}`);
+    signalInput.disabled = false;
+    roomInput.disabled = false;
+    joinBtn.disabled = false;
+  }
+});
+
+sendForm.addEventListener('submit', (e) => {
+  e.preventDefault();
+  const text = msgInput.value.trim();
+  if (!text) return;
+  let sent = 0;
+  for (const p of peers.values()) {
+    if (p.dc && p.dc.readyState === 'open') { p.dc.send(text); sent++; }
+  }
+  if (sent > 0) { addMessage(text, 'sent'); msgInput.value = ''; }
+});
+
+window.addEventListener('pagehide', () => {
+  polling = false;
+  if (myId && token) {
+    fetch(roomPath('leave'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ peer_id: myId, token }),
+      keepalive: true,
+    }).catch(() => {});
+  }
+});
+</script>
+</body>
+</html>

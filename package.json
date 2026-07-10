@@ -1,0 +1,9 @@
+{
+  "name": "webrtc-text-demo",
+  "version": "1.0.0",
+  "description": "WebRTC DataChannel 텍스트 송수신 데모 (signalsvc HTTP long-poll 시그널링)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
