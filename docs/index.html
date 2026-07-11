@@ -58,6 +58,11 @@
 // edge 는 answerer 전용이므로 offer 는 항상 브라우저 몫: join 시 edge 가 있으면,
 // 그리고 edge 의 peer-joined(재기동 포함)마다 새로 offer 한다.
 const DEFAULT_SIGNAL = 'https://signalsvc-116558809518.asia-northeast3.run.app';
+// LTE 검증용 무료 공개 TURN (Metered Open Relay) — 핸드폰 입력 번거로움 방지 기본값.
+// 테스트용이라 불안정할 수 있음. 실제 서비스는 Cloudflare/Metered 등 자기 자격증명 사용.
+const DEFAULT_TURN = 'turn:openrelay.metered.ca:80,turn:openrelay.metered.ca:443,turn:openrelay.metered.ca:443?transport=tcp';
+const DEFAULT_TURN_USER = 'openrelayproject';
+const DEFAULT_TURN_CRED = 'openrelayproject';
 const EDGE_PEER = 'edge'; // edge 의 룸 내 peer_id (edgeservice config p2p.peer_id 기본값)
 let signalBase = DEFAULT_SIGNAL; // 입장 시 입력창 값으로 확정
 const STUN = [{ urls: 'stun:stun.l.google.com:19302' }];
@@ -290,9 +295,11 @@ function closePeer(id, reason) {
 signalInput.value = new URLSearchParams(location.search).get('signal')
   || localStorage.getItem('signalBase')
   || DEFAULT_SIGNAL;
-turnInput.value = localStorage.getItem('turnUrl') || '';
-turnUser.value = localStorage.getItem('turnUser') || '';
-turnCred.value = localStorage.getItem('turnCred') || '';
+// TURN 기본값: 지난번 사용값(localStorage) > openrelay 기본값. getItem 이 빈 문자열이면
+// "일부러 비웠다"는 뜻이므로 ?? 로 구분 (|| 를 쓰면 빈값도 기본값으로 되돌아감).
+turnInput.value = localStorage.getItem('turnUrl') ?? DEFAULT_TURN;
+turnUser.value = localStorage.getItem('turnUser') ?? DEFAULT_TURN_USER;
+turnCred.value = localStorage.getItem('turnCred') ?? DEFAULT_TURN_CRED;
 
 roomForm.addEventListener('submit', async (e) => {
   e.preventDefault();
