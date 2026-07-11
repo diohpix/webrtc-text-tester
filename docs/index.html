@@ -291,8 +291,9 @@ async function handleAnswer(from, payload) {
 async function handleIce(from, payload) {
   const p = peers.get(from);
   if (!p) { addMessage(`⚠ ${from} ICE 수신했으나 해당 피어 없음 — 버림`, 'sys'); return; }
-  // 원격 후보 타입 파악 (candidate 문자열: "... typ host|srflx|relay ...")
-  const t = (payload.candidate?.match(/typ (\w+)/) || [])[1] || '?';
+  // 원격 후보 파악 (candidate 문자열: "... <IP> <PORT> typ host|srflx|relay ...")
+  const mm = payload.candidate?.match(/ (\S+) (\d+) typ (\w+)/);
+  const t = mm ? `${mm[3]} ${mm[1]}:${mm[2]}` : '?';
   if (!p.remoteSet) { p.pending.push(payload); addMessage(`${from} ICE 후보 수신(${t}) — remote 설정 전이라 버퍼`, 'sys'); return; }
   addMessage(`${from} ICE 후보 수신(${t}) 적용`, 'sys');
   await p.pc.addIceCandidate(payload).catch(e => console.warn('[P2P] addIceCandidate:', e));
