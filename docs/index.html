@@ -167,6 +167,7 @@ async function pollLoop() {
       msgs = (await res.json()).messages || [];
     } catch (err) {
       console.warn('[P2P] poll 오류:', err);
+      addMessage(`⚠ poll 오류: ${err.message} — 2초 후 재시도`, 'sys');
       await new Promise(r => setTimeout(r, 2000));
       continue;
     }
@@ -215,6 +216,7 @@ function newPeer(id) {
   };
   pc.onconnectionstatechange = () => {
     console.log(`[P2P] peer=${id} state=${pc.connectionState}`);
+    addMessage(`[${id}] connectionState=${pc.connectionState}`, 'sys');
     if (pc.connectionState === 'failed') {
       addMessage(`${id} 연결 실패 (ICE failed — NAT 통과 불가, TURN 필요 가능성)`, 'sys');
     }
@@ -222,6 +224,9 @@ function newPeer(id) {
       closePeer(id, pc.connectionState);
     }
     refreshStatus();
+  };
+  pc.oniceconnectionstatechange = () => {
+    addMessage(`[${id}] iceConnectionState=${pc.iceConnectionState}`, 'sys');
   };
   return p;
 }
@@ -266,9 +271,13 @@ async function handleOffer(from, payload) {
 
 async function handleAnswer(from, payload) {
   const p = peers.get(from);
-  if (!p) return console.warn(`[P2P] answer from unknown peer ${from}`);
+  if (!p) { addMessage(`⚠ ${from} answer 수신했으나 해당 피어 없음 — 버림`, 'sys'); return; }
   // 재협상 직후 이전 offer 에 대한 늦은 answer 방어: offer 대기 상태가 아니면 무시
-  if (p.pc.signalingState !== 'have-local-offer') return console.warn(`[P2P] stale answer from ${from} 무시`);
+  if (p.pc.signalingState !== 'have-local-offer') {
+    addMessage(`⚠ ${from} answer 수신했으나 상태=${p.pc.signalingState} (have-local-offer 아님) — 버림`, 'sys');
+    return;
+  }
+  addMessage(`${from} answer 수신 — remote 설정, ICE 검사 시작`, 'sys');
   await p.pc.setRemoteDescription(payload);
   p.remoteSet = true;
   for (const c of p.pending.splice(0)) await p.pc.addIceCandidate(c).catch(e => console.warn(e));
@@ -276,7 +285,7 @@ async function handleAnswer(from, payload) {
 
 async function handleIce(from, payload) {
   const p = peers.get(from);
-  if (!p) return console.warn(`[P2P] ice from unknown peer ${from}`);
+  if (!p) { addMessage(`⚠ ${from} ICE 수신했으나 해당 피어 없음 — 버림`, 'sys'); return; }
   if (!p.remoteSet) { p.pending.push(payload); return; }
   await p.pc.addIceCandidate(payload).catch(e => console.warn('[P2P] addIceCandidate:', e));
 }
