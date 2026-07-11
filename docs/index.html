@@ -38,6 +38,8 @@
   <button type="submit" id="join-btn">입장</button>
 </form>
 
+<button type="button" id="nat-btn" style="background:#555;margin-bottom:12px;">NAT 타입 진단 (Cone/Symmetric)</button>
+
 <div id="status">대기 중 — 방에 입장하세요</div>
 <div id="log"></div>
 
@@ -315,6 +317,59 @@ signalInput.value = new URLSearchParams(location.search).get('signal')
 turnInput.value = localStorage.getItem('turnUrl') ?? DEFAULT_TURN;
 turnUser.value = localStorage.getItem('turnUser') ?? DEFAULT_TURN_USER;
 turnCred.value = localStorage.getItem('turnCred') ?? DEFAULT_TURN_CRED;
+
+// --- NAT 타입 자가진단 ---
+// 하나의 RTCPeerConnection 에 STUN 서버 여러 개를 넣으면 모두 같은 로컬 base 포트에서
+// 요청이 나간다. 돌아온 공인(srflx) 포트가 하나면 endpoint-independent(=Cone), 목적지마다
+// 다르면 Symmetric. Symmetric 이면 STUN hole punching 이 실패하므로 TURN 이 필수다.
+const natBtn = document.getElementById('nat-btn');
+const NAT_STUN = [
+  'stun:stun.l.google.com:19302',
+  'stun:stun1.l.google.com:19302',
+  'stun:stun.cloudflare.com:3478',
+];
+async function diagnoseNat() {
+  natBtn.disabled = true;
+  addMessage('NAT 진단 시작 — STUN 3곳으로 후보 수집(최대 8초)…', 'sys');
+  const pc = new RTCPeerConnection({ iceServers: NAT_STUN.map(u => ({ urls: u })) });
+  pc.createDataChannel('nat');
+  const srflx = []; // {addr, port, rport}
+  pc.onicecandidate = (e) => {
+    if (!e.candidate) return;
+    const s = e.candidate.candidate; // "candidate:... udp <prio> <addr> <port> typ srflx raddr <ra> rport <rp>"
+    const m = s.match(/ (\S+) (\d+) typ srflx(?:.* rport (\d+))?/);
+    if (m) {
+      const rec = { addr: m[1], port: +m[2], rport: m[3] ? +m[3] : null };
+      srflx.push(rec);
+      addMessage(`srflx: ${rec.addr}:${rec.port}${rec.rport ? ` (local rport=${rec.rport})` : ''}`, 'sys');
+    }
+  };
+  try {
+    await pc.setLocalDescription(await pc.createOffer());
+  } catch (err) {
+    addMessage(`NAT 진단 실패: ${err.message}`, 'sys');
+    pc.close(); natBtn.disabled = false; return;
+  }
+  await new Promise((res) => {
+    const done = () => res();
+    pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') done(); };
+    setTimeout(done, 8000); // gathering 이 complete 안 떠도 강제 종료
+  });
+  pc.close();
+
+  const ports = [...new Set(srflx.map(s => s.port))];
+  const ips = [...new Set(srflx.map(s => s.addr))];
+  if (srflx.length === 0) {
+    addMessage('❌ srflx 후보 없음 — STUN 도달 실패(UDP 차단?). 판정 불가.', 'sys');
+  } else if (ports.length === 1) {
+    addMessage(`✅ 공인 포트 일정(${ports[0]}) → Cone NAT (endpoint-independent). STUN 만으로 P2P 가능성 높음.`, 'sys');
+  } else {
+    addMessage(`⚠️ 공인 포트가 여러 개 [${ports.join(', ')}] → ★ Symmetric NAT ★. STUN 무의미, TURN 필수.`, 'sys');
+  }
+  if (ips.length > 1) addMessage(`공인 IP 도 여러 개 [${ips.join(', ')}] — CGNAT 로드밸런싱 가능성.`, 'sys');
+  natBtn.disabled = false;
+}
+natBtn.addEventListener('click', diagnoseNat);
 
 roomForm.addEventListener('submit', async (e) => {
   e.preventDefault();
