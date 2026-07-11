@@ -20,7 +20,7 @@
   button { padding: 8px 16px; border: 0; border-radius: 6px; background: #2b6cb0; color: #fff; cursor: pointer; }
   button:disabled { background: #aaa; cursor: not-allowed; }
   #room-form { margin-bottom: 12px; flex-wrap: wrap; }
-  #signal-input { flex-basis: 100%; }
+  #signal-input, #turn-input { flex-basis: 100%; }
 </style>
 </head>
 <body>
@@ -28,6 +28,12 @@
 
 <form id="room-form">
   <input type="text" id="signal-input" placeholder="시그널 서버 주소 (https://...)">
+  <input type="text" id="turn-input" placeholder="TURN 서버 (선택, 예: turn:host:3478?transport=udp)">
+  <input type="text" id="turn-user" placeholder="TURN username (선택)">
+  <input type="text" id="turn-cred" placeholder="TURN credential (선택)">
+  <label style="flex-basis:100%;font-size:0.85rem;color:#555;">
+    <input type="checkbox" id="turn-only"> TURN 릴레이 강제 (relay 후보만 사용 — TURN 동작 확인용)
+  </label>
   <input type="text" id="room-input" placeholder="방 이름 (예: test)" value="YHS">
   <button type="submit" id="join-btn">입장</button>
 </form>
@@ -55,9 +61,17 @@ const DEFAULT_SIGNAL = 'https://signalsvc-116558809518.asia-northeast3.run.app';
 const EDGE_PEER = 'edge'; // edge 의 룸 내 peer_id (edgeservice config p2p.peer_id 기본값)
 let signalBase = DEFAULT_SIGNAL; // 입장 시 입력창 값으로 확정
 const STUN = [{ urls: 'stun:stun.l.google.com:19302' }];
+// LTE(이통사 CGNAT/Symmetric NAT)에서는 STUN 만으로 hole punching 이 실패한다.
+// 입장 시 TURN 입력값이 있으면 iceServers 에 더해 relay 후보로 우회한다.
+let iceServers = STUN;       // 입장 시 TURN 입력값으로 확정
+let iceTransportPolicy = 'all'; // 'relay' 로 두면 relay 후보만 써서 TURN 동작을 강제 확인
 const POLL_WAIT = 25;
 
 const signalInput = document.getElementById('signal-input');
+const turnInput = document.getElementById('turn-input');
+const turnUser = document.getElementById('turn-user');
+const turnCred = document.getElementById('turn-cred');
+const turnOnly = document.getElementById('turn-only');
 const statusEl = document.getElementById('status');
 const logEl = document.getElementById('log');
 const roomForm = document.getElementById('room-form');
@@ -178,12 +192,21 @@ async function handleSignal(msg) {
 
 // --- WebRTC ---
 function newPeer(id) {
-  const pc = new RTCPeerConnection({ iceServers: STUN });
+  const pc = new RTCPeerConnection({ iceServers, iceTransportPolicy });
   const p = { pc, dc: null, pending: [], remoteSet: false };
   peers.set(id, p);
 
   pc.onicecandidate = (e) => {
-    if (e.candidate) sendSignal(id, 'ice', e.candidate.toJSON());
+    if (e.candidate) {
+      console.log(`[P2P] local candidate type=${e.candidate.type} ${e.candidate.protocol} ${e.candidate.address}`);
+      sendSignal(id, 'ice', e.candidate.toJSON());
+    }
+  };
+  pc.onicegatheringstatechange = () => {
+    if (pc.iceGatheringState === 'complete') {
+      const types = (pc.localDescription?.sdp.match(/typ (\w+)/g) || []).map(s => s.slice(4));
+      addMessage(`ICE 후보 수집 완료: ${[...new Set(types)].join(', ') || '없음'}${types.includes('relay') ? '' : ' (relay 없음 — TURN 미설정)'}`, 'sys');
+    }
   };
   pc.onconnectionstatechange = () => {
     console.log(`[P2P] peer=${id} state=${pc.connectionState}`);
@@ -267,6 +290,9 @@ function closePeer(id, reason) {
 signalInput.value = new URLSearchParams(location.search).get('signal')
   || localStorage.getItem('signalBase')
   || DEFAULT_SIGNAL;
+turnInput.value = localStorage.getItem('turnUrl') || '';
+turnUser.value = localStorage.getItem('turnUser') || '';
+turnCred.value = localStorage.getItem('turnCred') || '';
 
 roomForm.addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -277,7 +303,22 @@ roomForm.addEventListener('submit', async (e) => {
     setStatus('https 페이지에서는 http:// 시그널 서버를 사용할 수 없습니다 (mixed content 차단)');
     return;
   }
+  // TURN 설정 조립 — 입력이 있으면 STUN 뒤에 붙인다
+  const turnUrl = turnInput.value.trim();
+  if (turnUrl) {
+    iceServers = [...STUN, {
+      urls: turnUrl.split(',').map(s => s.trim()).filter(Boolean),
+      username: turnUser.value.trim(),
+      credential: turnCred.value.trim(),
+    }];
+  } else {
+    iceServers = STUN;
+  }
+  iceTransportPolicy = turnOnly.checked ? 'relay' : 'all';
   localStorage.setItem('signalBase', signalBase);
+  localStorage.setItem('turnUrl', turnUrl);
+  localStorage.setItem('turnUser', turnUser.value.trim());
+  localStorage.setItem('turnCred', turnCred.value.trim());
   signalInput.disabled = true;
   roomInput.disabled = true;
   joinBtn.disabled = true;
