@@ -277,16 +277,22 @@ async function handleAnswer(from, payload) {
     addMessage(`⚠ ${from} answer 수신했으나 상태=${p.pc.signalingState} (have-local-offer 아님) — 버림`, 'sys');
     return;
   }
-  addMessage(`${from} answer 수신 — remote 설정, ICE 검사 시작`, 'sys');
+  const inSdp = (payload.sdp?.match(/a=candidate/g) || []).length;
+  addMessage(`${from} answer 수신 (SDP 내 후보 ${inSdp}개) — remote 설정, ICE 검사 시작`, 'sys');
   await p.pc.setRemoteDescription(payload);
   p.remoteSet = true;
+  const buffered = p.pending.length;
   for (const c of p.pending.splice(0)) await p.pc.addIceCandidate(c).catch(e => console.warn(e));
+  if (buffered) addMessage(`${from} 버퍼된 ICE 후보 ${buffered}개 적용`, 'sys');
 }
 
 async function handleIce(from, payload) {
   const p = peers.get(from);
   if (!p) { addMessage(`⚠ ${from} ICE 수신했으나 해당 피어 없음 — 버림`, 'sys'); return; }
-  if (!p.remoteSet) { p.pending.push(payload); return; }
+  // 원격 후보 타입 파악 (candidate 문자열: "... typ host|srflx|relay ...")
+  const t = (payload.candidate?.match(/typ (\w+)/) || [])[1] || '?';
+  if (!p.remoteSet) { p.pending.push(payload); addMessage(`${from} ICE 후보 수신(${t}) — remote 설정 전이라 버퍼`, 'sys'); return; }
+  addMessage(`${from} ICE 후보 수신(${t}) 적용`, 'sys');
   await p.pc.addIceCandidate(payload).catch(e => console.warn('[P2P] addIceCandidate:', e));
 }
 
