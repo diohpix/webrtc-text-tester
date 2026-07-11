@@ -91,6 +91,7 @@ const sendBtn = document.getElementById('send-btn');
 let room = null;
 let myId = null;
 let token = null;
+let lastSeq = 0; // 마지막으로 처리한 seq (ack 커서). join 시 0으로 리셋
 let polling = false;
 const peers = new Map(); // peerID -> {pc, dc, pending: [], remoteSet: false}
 
@@ -146,6 +147,7 @@ async function joinRoom() {
   const resp = await apiPost('join', {});
   myId = resp.peer_id;
   token = resp.token;
+  lastSeq = 0; // 재-join 시 서버 큐/seq 가 새로 시작하므로 커서 리셋
   addMessage(`"${room}" 방 입장 (내 ID: ${myId}, 기존 피어: ${resp.peers.length ? resp.peers.join(', ') : '없음'})`, 'sys');
   refreshStatus();
   // 1:N — edge 가 이미 룸에 있으면 edge 에게만 offer (다른 브라우저는 무시)
@@ -157,7 +159,7 @@ async function pollLoop() {
   while (polling) {
     let msgs;
     try {
-      const q = new URLSearchParams({ peer_id: myId, token, wait: POLL_WAIT });
+      const q = new URLSearchParams({ peer_id: myId, token, wait: POLL_WAIT, since: lastSeq });
       const res = await fetch(roomPath('poll') + '?' + q);
       if (res.status === 404 || res.status === 403) {
         // 서버에서 세션이 사라짐 — 재입장
@@ -173,7 +175,11 @@ async function pollLoop() {
       await new Promise(r => setTimeout(r, 2000));
       continue;
     }
-    for (const msg of msgs) await handleSignal(msg).catch(e => console.error('[P2P] handle:', e));
+    for (const msg of msgs) {
+      if (msg.seq <= lastSeq) continue; // 재전송된 중복 skip
+      lastSeq = msg.seq;                 // 커서 전진
+      await handleSignal(msg).catch(e => console.error('[P2P] handle:', e));
+    }
   }
 }
 
