@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebRTC 텍스트 송수신 (WebSocket 시그널)</title>
+<style>
+  body { font-family: -apple-system, "Apple SD Gothic Neo", sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; }
+  h1 { font-size: 1.3rem; }
+  #status { padding: 8px 12px; border-radius: 6px; background: #eee; margin-bottom: 12px; font-size: 0.9rem; }
+  #status.connected { background: #d4f7d4; }
+  #log { border: 1px solid #ccc; border-radius: 6px; height: 300px; overflow-y: auto; padding: 8px; margin-bottom: 12px; }
+  .msg { margin: 4px 0; padding: 6px 10px; border-radius: 8px; max-width: 80%; width: fit-content; }
+  .msg.recv { background: #f0f0f0; }
+  .msg.sent { background: #d0e7ff; margin-left: auto; }
+  .msg.sys { background: none; color: #888; font-size: 0.8rem; }
+  .msg .meta { font-size: 0.7rem; color: #888; display: block; }
+  form { display: flex; gap: 8px; }
+  input[type=text] { flex: 1; padding: 8px; border: 1px solid #ccc; border-radius: 6px; }
+  button { padding: 8px 16px; border: 0; border-radius: 6px; background: #2b6cb0; color: #fff; cursor: pointer; }
+  button:disabled { background: #aaa; cursor: not-allowed; }
+  #room-form { margin-bottom: 12px; flex-wrap: wrap; }
+  #signal-input { flex-basis: 100%; }
+</style>
+</head>
+<body>
+<h1>WebRTC DataChannel 텍스트 송수신 <small>(WebSocket 시그널)</small></h1>
+
+<form id="room-form">
+  <input type="text" id="signal-input" placeholder="시그널 서버 주소 (https://... 또는 wss://...)">
+  <input type="text" id="room-input" placeholder="방 이름 (예: test)" value="YHS">
+  <button type="submit" id="join-btn">입장</button>
+</form>
+
+<div id="status">대기 중 — 방에 입장하세요</div>
+<div id="log"></div>
+
+<form id="send-form">
+  <input type="text" id="msg-input" placeholder="보낼 메시지" disabled>
+  <button type="submit" id="send-btn" disabled>전송</button>
+</form>
+
+<script>
+// WebSocket 시그널링 프로토콜 — edge WebSocket 게이트웨이(signal.service.ts)로 통합된 버전.
+// 하나의 WebSocket 연결(wss://<host>/signal) 위에서 프레임을 주고받는다:
+//   → {event:'signal', action:'join',  room, peer_id?}                        (server → {type:'joined', peer_id, token, peers})
+//   → {event:'signal', action:'send',  room, from, token, to?, kind, payload}
+//   → {event:'signal', action:'leave', room, peer_id, token}
+//   ← {event:'signal', kind:'offer'|'answer'|'ice'|'peer-joined'|'peer-left', from, payload}
+//   ← {event:'signal', type:'error', error}
+// 기존 HTTP long-poll(POST /rooms/{room}/join|send, GET /poll)을 대체 — 폴링 없이 서버가 push.
+// 토폴로지: 1:N 별형(star) — 이 페이지는 edge 하고만 연결한다. 브라우저끼리는
+// offer 하지도, 받아주지도 않는다. edge 는 answerer 전용이므로 offer 는 항상 브라우저 몫:
+// join 시 edge 가 있으면, 그리고 edge 의 peer-joined(재기동 포함)마다 새로 offer 한다.
+const DEFAULT_SIGNAL = 'https://signalsvc-116558809518.asia-northeast3.run.app';
+const EDGE_PEER = 'edge'; // edge 의 룸 내 peer_id (edgeservice config p2p.peer_id 기본값)
+let signalBase = DEFAULT_SIGNAL; // 입장 시 입력창 값으로 확정
+const STUN = [{ urls: 'stun:stun.l.google.com:19302' }];
+const RECONNECT_DELAY = 2000;
+
+const signalInput = document.getElementById('signal-input');
+const statusEl = document.getElementById('status');
+const logEl = document.getElementById('log');
+const roomForm = document.getElementById('room-form');
+const roomInput = document.getElementById('room-input');
+const joinBtn = document.getElementById('join-btn');
+const sendForm = document.getElementById('send-form');
+const msgInput = document.getElementById('msg-input');
+const sendBtn = document.getElementById('send-btn');
+
+let room = null;
+let myId = null;      // 서버가 최초 join 시 배정. 재연결 시 재사용(takeover)한다.
+let token = null;
+let ws = null;
+let leaving = false;  // 의도적 종료 여부(재연결 억제)
+let reconnectTimer = null;
+const peers = new Map(); // peerID -> {pc, dc, pending: [], remoteSet: false}
+
+function setStatus(text, connected = false) {
+  statusEl.textContent = text;
+  statusEl.classList.toggle('connected', connected);
+}
+
+function refreshStatus() {
+  const open = [...peers.entries()].filter(([, p]) => p.dc && p.dc.readyState === 'open').map(([id]) => id);
+  const ok = open.length > 0;
+  setStatus(`내 ID: ${myId} · 연결된 피어: ${ok ? open.join(', ') : '없음'}`, ok);
+  msgInput.disabled = !ok;
+  sendBtn.disabled = !ok;
+}
+
+function addMessage(text, kind, from) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + kind;
+  if (kind !== 'sys') {
+    const meta = document.createElement('span');
+    meta.className = 'meta';
+    meta.textContent = (kind === 'recv' ? `수신 ← ${from}` : '송신') + ' · ' + new Date().toLocaleTimeString();
+    div.appendChild(meta);
+  }
+  div.appendChild(document.createTextNode(text));
+  logEl.appendChild(div);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// --- 시그널링 (WebSocket) ---
+// https://host → wss://host/signal, http://host → ws://host/signal
+function signalWsUrl() {
+  return signalBase.replace(/^http/, 'ws') + '/signal';
+}
+
+// 시그널 소켓을 열고 open 될 때까지 기다린다. 수신 프레임은 routeMessage 로 전달.
+function openSignal() {
+  return new Promise((resolve, reject) => {
+    const url = signalWsUrl();
+    ws = new WebSocket(url);
+    let settled = false;
+    ws.onopen = () => { settled = true; resolve(); };
+    ws.onerror = () => { if (!settled) { settled = true; reject(new Error('시그널 서버 연결 실패')); } };
+    ws.onmessage = (e) => {
+      let m; try { m = JSON.parse(e.data); } catch { return; }
+      routeMessage(m);
+    };
+    ws.onclose = () => {
+      // 의도적 종료가 아니면 재연결 후 재-join
+      if (leaving) return;
+      setStatus('시그널 연결 끊김 — 재연결 중…');
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(async () => {
+        try { await joinRoom(); } catch (err) { console.warn('[P2P] 재연결 실패:', err); ws && ws.onclose(); }
+      }, RECONNECT_DELAY);
+    };
+  });
+}
+
+function routeMessage(m) {
+  if (m.type === 'joined') return onJoined(m);
+  if (m.type === 'error') return onError(m);
+  if (m.kind) return handleSignal(m).catch(e => console.error('[P2P] handle:', e));
+}
+
+function onJoined(resp) {
+  myId = resp.peer_id;
+  token = resp.token;
+  addMessage(`"${room}" 방 입장 (내 ID: ${myId}, 기존 피어: ${resp.peers.length ? resp.peers.join(', ') : '없음'})`, 'sys');
+  refreshStatus();
+  // 1:N — edge 가 이미 룸에 있으면 edge 에게만 offer.
+  // 단 이미 열린 채널이 있으면(단순 시그널 재연결) 살아있는 연결을 끊지 않는다.
+  if (resp.peers.includes(EDGE_PEER)) {
+    const existing = peers.get(EDGE_PEER);
+    if (!(existing && existing.dc && existing.dc.readyState === 'open')) connectTo(EDGE_PEER);
+  }
+}
+
+function onError(m) {
+  console.warn('[P2P] signal error:', m.error);
+  // 세션이 서버에서 사라진 경우(만료/takeover) — 재-join
+  if (['unknown peer', 'bad token', 'unknown room'].includes(m.error)) {
+    addMessage('시그널 세션 만료 — 재입장합니다', 'sys');
+    joinRoom().catch(err => console.warn('[P2P] 재입장 실패:', err));
+  }
+}
+
+function sendSignal(to, kind, payload) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) { console.warn(`[P2P] send ${kind} 실패: 소켓 미연결`); return; }
+  ws.send(JSON.stringify({ event: 'signal', action: 'send', room, from: myId, token, to, kind, payload }));
+}
+
+// 소켓을 (필요시) 열고 join 프레임을 보낸다. 재연결 시 기존 myId 재사용(takeover).
+async function joinRoom() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) await openSignal();
+  ws.send(JSON.stringify({ event: 'signal', action: 'join', room, peer_id: myId || undefined }));
+}
+
+async function handleSignal(msg) {
+  switch (msg.kind) {
+    case 'offer': return handleOffer(msg.from, msg.payload);
+    case 'answer': return handleAnswer(msg.from, msg.payload);
+    case 'ice': return handleIce(msg.from, msg.payload);
+    case 'peer-joined':
+      addMessage(`피어 입장: ${msg.from}`, 'sys');
+      // 1:N — edge 가 (재)기동해 들어온 경우에만 재-offer. edge 는 answerer
+      // 전용이라 이쪽에서 offer 해야만 연결된다. 다른 브라우저 입장은 표시만.
+      if (msg.from === EDGE_PEER) await connectTo(msg.from);
+      break;
+    case 'peer-left': {
+      addMessage(`피어 퇴장: ${msg.from}`, 'sys');
+      const p = peers.get(msg.from);
+      // 룸 퇴장이 곧 P2P 종료는 아님 — 협상 중이던 상태만 정리
+      if (p && (!p.dc || p.dc.readyState !== 'open')) closePeer(msg.from, 'peer-left before connect');
+      break;
+    }
+  }
+}
+
+// --- WebRTC (transport 무관 — 기존과 동일) ---
+function newPeer(id) {
+  const pc = new RTCPeerConnection({ iceServers: STUN });
+  const p = { pc, dc: null, pending: [], remoteSet: false };
+  peers.set(id, p);
+
+  pc.onicecandidate = (e) => {
+    if (e.candidate) sendSignal(id, 'ice', e.candidate.toJSON());
+  };
+  pc.onconnectionstatechange = () => {
+    console.log(`[P2P] peer=${id} state=${pc.connectionState}`);
+    if (pc.connectionState === 'failed') {
+      addMessage(`${id} 연결 실패 (ICE failed — NAT 통과 불가, TURN 필요 가능성)`, 'sys');
+    }
+    if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+      closePeer(id, pc.connectionState);
+    }
+    refreshStatus();
+  };
+  return p;
+}
+
+function setupChannel(id, p, dc) {
+  p.dc = dc;
+  dc.onopen = () => { addMessage(`데이터채널 연결됨: ${id}`, 'sys'); refreshStatus(); };
+  // 텍스트 수신 지점
+  dc.onmessage = (e) => addMessage(typeof e.data === 'string' ? e.data : new TextDecoder().decode(e.data), 'recv', id);
+  dc.onclose = () => refreshStatus();
+}
+
+// offerer: 기존 피어에게 연결 시도
+async function connectTo(id) {
+  closePeer(id, 're-connect');
+  const p = newPeer(id);
+  setupChannel(id, p, p.pc.createDataChannel('chat'));
+  const offer = await p.pc.createOffer();
+  await p.pc.setLocalDescription(offer);
+  sendSignal(id, 'offer', p.pc.localDescription.toJSON());
+  addMessage(`${id} 에게 offer 전송 — 연결 시도 중…`, 'sys');
+}
+
+// answerer 역할: 1:N 에서는 edge 가 offer 하지 않으므로 정상 흐름에서 여기 올 일이
+// 없다. 다른 브라우저(구버전 페이지 등)의 offer 는 받지 않는다.
+async function handleOffer(from, payload) {
+  if (from !== EDGE_PEER) {
+    console.log(`[P2P] 1:N — ${from} 의 offer 무시 (edge 전용 연결)`);
+    return;
+  }
+  closePeer(from, 're-offer');
+  const p = newPeer(from);
+  p.pc.ondatachannel = (e) => setupChannel(from, p, e.channel);
+  await p.pc.setRemoteDescription(payload);
+  p.remoteSet = true;
+  for (const c of p.pending.splice(0)) await p.pc.addIceCandidate(c).catch(e => console.warn(e));
+  const answer = await p.pc.createAnswer();
+  await p.pc.setLocalDescription(answer);
+  sendSignal(from, 'answer', p.pc.localDescription.toJSON());
+  addMessage(`${from} 의 offer 에 answer 전송 — 연결 시도 중…`, 'sys');
+}
+
+async function handleAnswer(from, payload) {
+  const p = peers.get(from);
+  if (!p) return console.warn(`[P2P] answer from unknown peer ${from}`);
+  // 재협상 직후 이전 offer 에 대한 늦은 answer 방어: offer 대기 상태가 아니면 무시
+  if (p.pc.signalingState !== 'have-local-offer') return console.warn(`[P2P] stale answer from ${from} 무시`);
+  await p.pc.setRemoteDescription(payload);
+  p.remoteSet = true;
+  for (const c of p.pending.splice(0)) await p.pc.addIceCandidate(c).catch(e => console.warn(e));
+}
+
+async function handleIce(from, payload) {
+  const p = peers.get(from);
+  if (!p) return console.warn(`[P2P] ice from unknown peer ${from}`);
+  if (!p.remoteSet) { p.pending.push(payload); return; }
+  await p.pc.addIceCandidate(payload).catch(e => console.warn('[P2P] addIceCandidate:', e));
+}
+
+function closePeer(id, reason) {
+  const p = peers.get(id);
+  if (!p) return;
+  peers.delete(id);
+  p.pc.close();
+  console.log(`[P2P] closed peer=${id} (${reason})`);
+  refreshStatus();
+}
+
+// --- UI ---
+// 시그널 주소 초기값: ?signal= 쿼리 > 지난번 사용값(localStorage) > 기본값
+signalInput.value = new URLSearchParams(location.search).get('signal')
+  || localStorage.getItem('signalBase')
+  || DEFAULT_SIGNAL;
+
+roomForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  room = roomInput.value.trim();
+  signalBase = signalInput.value.trim().replace(/\/+$/, '');
+  if (!room || !signalBase) return;
+  if (location.protocol === 'https:' && signalWsUrl().startsWith('ws://')) {
+    setStatus('https 페이지에서는 ws:// 시그널 서버를 사용할 수 없습니다 (mixed content 차단). wss:// 를 쓰세요.');
+    return;
+  }
+  localStorage.setItem('signalBase', signalBase);
+  leaving = false;
+  signalInput.disabled = true;
+  roomInput.disabled = true;
+  joinBtn.disabled = true;
+  try {
+    await joinRoom();
+  } catch (err) {
+    setStatus(`입장 실패: ${err.message}`);
+    signalInput.disabled = false;
+    roomInput.disabled = false;
+    joinBtn.disabled = false;
+  }
+});
+
+sendForm.addEventListener('submit', (e) => {
+  e.preventDefault();
+  const text = msgInput.value.trim();
+  if (!text) return;
+  let sent = 0;
+  for (const p of peers.values()) {
+    if (p.dc && p.dc.readyState === 'open') { p.dc.send(text); sent++; }
+  }
+  if (sent > 0) { addMessage(text, 'sent'); msgInput.value = ''; }
+});
+
+window.addEventListener('pagehide', () => {
+  leaving = true;
+  clearTimeout(reconnectTimer);
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    if (myId && token) ws.send(JSON.stringify({ event: 'signal', action: 'leave', room, peer_id: myId, token }));
+    ws.close();
+  }
+});
+</script>
+</body>
+</html>
